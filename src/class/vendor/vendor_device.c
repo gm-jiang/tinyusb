@@ -59,7 +59,8 @@ typedef struct
   CFG_TUSB_MEM_ALIGN uint8_t epin_buf[CFG_TUD_VENDOR_EPSIZE];
 } vendord_interface_t;
 
-CFG_TUD_MEM_SECTION tu_static vendord_interface_t _vendord_itf[CFG_TUD_VENDOR];
+CFG_TUSB_MEM_SECTION tu_static vendord_interface_t _vendord_itf[CFG_TUD_VENDOR];
+CFG_TUSB_MEM_SECTION uint8_t vendor_ctrlreq_buf[CFG_TUD_VENDOR_RX_BUFSIZE];
 
 #define ITF_MEM_RESET_SIZE   offsetof(vendord_interface_t, rx_ff)
 
@@ -247,6 +248,39 @@ uint16_t vendord_open(uint8_t rhport, tusb_desc_interface_t const * desc_itf, ui
   }
 
   return (uint16_t) ((uintptr_t) p_desc - (uintptr_t) desc_itf);
+}
+
+// Invoked when a control transfer occurred on an interface of this class
+// Driver response accordingly to the request and the transfer stage (setup/data/ack)
+// return false to stall control endpoint (e.g unsupported request)
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const * request)
+{
+  // nothing to with DATA & ACK stage
+  if (stage != CONTROL_STAGE_SETUP) return true;
+
+  switch (request->bmRequestType_bit.type)
+  {
+    case TUSB_REQ_TYPE_VENDOR:
+      switch (request->bRequest)
+      {
+        case VENDOR_REQUEST_RW:
+          /* Note that vendor_ctrlreq_buf size must be greater than wLength */
+          return tud_control_xfer(rhport, request, (void*)vendor_ctrlreq_buf, request->wLength);
+
+        default: break;
+      }
+    break;
+
+    case TUSB_REQ_TYPE_CLASS:
+        // todo
+        // response with status OK
+        return tud_control_status(rhport, request);
+
+    default: break;
+  }
+
+  // stall unknown request
+  return false;
 }
 
 bool vendord_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
