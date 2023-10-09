@@ -31,6 +31,8 @@
  extern "C" {
 #endif
 
+#include "ets/ets_sys.h"
+
 //--------------------------------------------------------------------+
 // Debug
 //--------------------------------------------------------------------+
@@ -55,7 +57,7 @@ void tu_print_mem(void const *buf, uint32_t count, uint8_t indent);
   extern int CFG_TUSB_DEBUG_PRINTF(const char *format, ...);
   #define tu_printf    CFG_TUSB_DEBUG_PRINTF
 #else
-  #define tu_printf    printf
+  #define tu_printf    ets_printf
 #endif
 
 static inline void tu_print_arr(uint8_t const* buf, uint32_t bufsize)
