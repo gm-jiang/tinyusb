@@ -298,7 +298,7 @@
 //--------------------------------------------------------------------+
 // Espressif
 //--------------------------------------------------------------------+
-#elif TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3)
+#elif TU_CHECK_MCU(OPT_MCU_ESP32S2, OPT_MCU_ESP32S3, OPT_MCU_ESP32C5)
   #define TUP_USBIP_DWC2
   #define TUP_DCD_ENDPOINT_MAX    6
 

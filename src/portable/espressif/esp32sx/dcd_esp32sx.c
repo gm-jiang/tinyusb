@@ -28,19 +28,17 @@
 
 #include "tusb_option.h"
 
-#if (((CFG_TUSB_MCU == OPT_MCU_ESP32S2) ||  (CFG_TUSB_MCU == OPT_MCU_ESP32S3)) && CFG_TUD_ENABLED)
+#if (((CFG_TUSB_MCU == OPT_MCU_ESP32S2) || (CFG_TUSB_MCU == OPT_MCU_ESP32C5) || (CFG_TUSB_MCU == OPT_MCU_ESP32S3)) && CFG_TUD_ENABLED)
 
 // Espressif
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_intr_alloc.h"
+//#include "esp_intr_alloc.h"
+#include "ets/ets_sys.h"
 #include "esp_log.h"
-#include "soc/dport_reg.h"
-#include "soc/gpio_sig_map.h"
-#include "soc/usb_periph.h"
-#include "soc/periph_defs.h" // for interrupt source
 
 #include "device/dcd.h"
+#include "soc/usb_reg.h"
+#include "soc/usb_struct.h"
+#include "soc/usb_types.h"
 
 // Max number of bi-directional endpoints including EP0
 // Note: ESP32S2 specs say there are only up to 5 IN active endpoints include EP0
@@ -53,6 +51,16 @@
 // Max number of IN EP FIFOs
 #define EP_FIFO_NUM 5
 
+#define USB_DW_MAC_IF_8BIT_UTMI         (9 << 10) //4'h9: when the MAC interface is 8bit UTMI+
+#define USB_DW_PHY_SEL_HS_UTMI          (0 << 6) //0: usb2.0 high-speed utmi+
+#define USB_DW_UTMI_IF                  (0 << 4) //0: utmi+
+#define USB_DW_PHY_IF_MODE              (1 << 3) //0: 8bit, 1: 16bit
+#define USB_DW_TAR_VALUE                (5)
+
+#define USB_DW_GRSTCTL_C_SFT_RST        BIT(0)
+#define USB_DW_GRSTCTL_AHB_IDLE         BIT(31)
+#define USB_DW_CORE_RST_TIMEOUT_US      (10000)
+
 typedef struct {
     uint8_t *buffer;
     // tu_fifo_t * ff; // TODO support dcd_edpt_xfer_fifo API
@@ -64,7 +72,6 @@ typedef struct {
 } xfer_ctl_t;
 
 static const char *TAG = "TUSB:DCD";
-static intr_handle_t usb_ih;
 
 
 static uint32_t _setup_packet[2];
@@ -126,7 +133,7 @@ static void bus_reset(void)
   //   Recommended value = 10 + 1 + 2 x (16+2) = 47 --> Let's make it 52
   USB0.grstctl |= 0x10 << USB_TXFNUM_S; // fifo 0x10,
   USB0.grstctl |= USB_TXFFLSH_M;        // Flush fifo
-  USB0.grxfsiz = 52;
+  USB0.grxfsiz = 512;                   //RX FIFO fifo for High-speed
 
   // Control IN uses FIFO 0 with 64 bytes ( 16 32-bit word )
   USB0.gnptxfsiz = (16 << USB_NPTXFDEP_S) | (USB0.grxfsiz & 0x0000ffffUL);
@@ -144,8 +151,21 @@ static void enum_done_processing(void)
   // However, keep for debugging and in case Low Speed is ever supported.
   uint32_t enum_spd = (USB0.dsts >> USB_ENUMSPD_S) & (USB_ENUMSPD_V);
 
+  const char *speedstr[] = {"High", "Full(30M)", "Low", "Full(48M)"};
+  ESP_EARLY_LOGI(TAG, "dcd_int_handler - %s speed enumeration done!", speedstr[enum_spd]);
+
   // Maximum packet size for EP 0 is set for both directions by writing DIEPCTL
   if (enum_spd == 0x03) { // Full-Speed (PHY on 48 MHz)
+    USB0.in_ep_reg[0].diepctl &= ~USB_D_MPS0_V;    // 64 bytes
+    USB0.in_ep_reg[0].diepctl &= ~USB_D_STALL0_M; // clear Stall
+    xfer_status[0][TUSB_DIR_OUT].max_size = 64;
+    xfer_status[0][TUSB_DIR_IN].max_size = 64;
+  } else if (enum_spd == 0x01) { // Full-Speed (PHY on 30MHz)
+    USB0.in_ep_reg[0].diepctl &= ~USB_D_MPS0_V;    // 64 bytes
+    USB0.in_ep_reg[0].diepctl &= ~USB_D_STALL0_M; // clear Stall
+    xfer_status[0][TUSB_DIR_OUT].max_size = 64;
+    xfer_status[0][TUSB_DIR_IN].max_size = 64;
+  } else if (enum_spd == 0x00) { // High-Speed (PHY on 30MHz)
     USB0.in_ep_reg[0].diepctl &= ~USB_D_MPS0_V;    // 64 bytes
     USB0.in_ep_reg[0].diepctl &= ~USB_D_STALL0_M; // clear Stall
     xfer_status[0][TUSB_DIR_OUT].max_size = 64;
@@ -158,6 +178,34 @@ static void enum_done_processing(void)
   }
 }
 
+static int usb_dwc_reset(void)
+{
+  uint32_t cnt = 0;
+
+  /* Wait for AHB master idle state. */
+  while (!(USB0.grstctl & USB_DW_GRSTCTL_AHB_IDLE)) {
+    ets_delay_us(1);
+    if (++cnt > USB_DW_CORE_RST_TIMEOUT_US) {
+      ESP_LOGE(TAG, "USB reset HANG! AHB Idle GRSTCTL = 0x%08x", USB0.grstctl);
+      return -1;
+    }
+  }
+
+  /* Core Soft Reset */
+  cnt = 0;
+  USB0.grstctl |= USB_DW_GRSTCTL_C_SFT_RST;
+  do {
+    if (++cnt > USB_DW_CORE_RST_TIMEOUT_US) {
+      ESP_LOGE(TAG, "USB reset HANG! Soft Reset CRSTCTL=0x%08x", USB0.grstctl);
+      return -1;
+    }
+    ets_delay_us(1);
+  } while (USB0.grstctl & USB_DW_GRSTCTL_C_SFT_RST);
+
+  ets_delay_us(100);
+
+  return 0;
+}
 
 /*------------------------------------------------------------------*/
 /* Controller API
@@ -170,14 +218,34 @@ void dcd_init(uint8_t rhport)
   ESP_LOGV(TAG, "DCD init - Soft DISCONNECT and Setting up");
   USB0.dctl |= USB_SFTDISCON_M; // Soft disconnect
 
+  ESP_LOGV(TAG, "DCD USB OTG guid=%x gsnpsid=%x", USB0.guid, USB0.gsnpsid);
+
+  usb_dwc_reset();
+
+  //Note that this clears any PHY config that is set in HW or earlier in SW.
+  USB0.gusbcfg = USB_FORCEDEVMODE_M |
+                USB_DW_MAC_IF_8BIT_UTMI |
+                USB_DW_PHY_SEL_HS_UTMI |
+                USB_DW_UTMI_IF |
+                USB_DW_PHY_IF_MODE |
+                USB_DW_TAR_VALUE;
+
   // B. Programming DCFG
   /* If USB host misbehaves during status portion of control xfer
     (non zero-length packet), send STALL back and discard. Full speed. */
+#if CFG_TUSB_MCU == OPT_MCU_ESP32S2
+  ESP_LOGD(TAG, "DCD init - USB1.1 SPD FS");
   USB0.dcfg |= USB_NZSTSOUTHSHK_M | // NonZero .... STALL
-      (3 << 0);            // dev speed: fullspeed 1.1 on 48 mhz  // USB_ENA32KHZSUSP bit is defined from IDF v5.1 onwards
+      (3 << 0);            // dev speed: fullspeed 1.1 on 48 mhz  // TODO no value in usb_reg.h (IDF-1476)
+#elif CFG_TUSB_MCU == OPT_MCU_ESP32C5
+  ESP_LOGD(TAG, "DCD init - USB2.0 SPD HS");
+  USB0.dcfg |= USB_NZSTSOUTHSHK_M | // NoZero ... STALL
+      (0 << 0);            // dev speed: highspeed 2.0 on 30 mhz
+#else
+    #error "Target dones not support!!!"
+#endif
 
   USB0.gahbcfg |= USB_NPTXFEMPLVL_M | USB_GLBLLNTRMSK_M; // Global interruptions ON
-  USB0.gusbcfg |= USB_FORCEDEVMODE_M;                    // force devmode
   USB0.gotgctl &= ~(USB_BVALIDOVVAL_M | USB_BVALIDOVEN_M | USB_VBVALIDOVVAL_M); //no overrides
 
   // C. Setting SNAKs, then connect
@@ -224,7 +292,7 @@ void dcd_remote_wakeup(uint8_t rhport)
   USB0.gintmsk |= USB_SOFMSK_M;
 
   // Per specs: remote wakeup signal bit must be clear within 1-15ms
-  vTaskDelay(pdMS_TO_TICKS(1));
+  //vTaskDelay(pdMS_TO_TICKS(1));//TODO: FIXME
 
   USB0.dctl &= ~USB_RMTWKUPSIG_M;
 }
@@ -315,13 +383,15 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc_edpt)
     USB0.daintmsk |= (1 << (0 + epnum));
 
     // Both TXFD and TXSA are in unit of 32-bit words.
-    // IN FIFO 0 was configured during enumeration, hence the "+ 16".
-    uint16_t const allocated_size = (USB0.grxfsiz & 0x0000ffff) + 16;
-    uint16_t const fifo_size = (EP_FIFO_SIZE/4 - allocated_size) / (EP_FIFO_NUM-1);
-    uint32_t const fifo_offset = allocated_size + fifo_size*(fifo_num-1);
+    //RX FIFO and IN FIFO 0 was configured during enumeration, hence the "512+ 16".
+    static uint32_t fifo_offset = (512 + 16);
+    uint16_t fifo_size = (xfer->max_size / 4);
+    fifo_offset += fifo_size;
 
     // DIEPTXF starts at FIFO #1.
     USB0.dieptxf[epnum - 1] = (fifo_size << USB_NPTXFDEP_S) | fifo_offset;
+
+    ESP_LOGD(TAG, "IN FIFO%d maped to IN Endpoint%d (fifo size = %d, fifo offset = 0x%08x)", fifo_num, epnum, fifo_size, fifo_offset);
   }
   return true;
 }
@@ -372,7 +442,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
     num_packets++;
   }
 
-  ESP_LOGV(TAG, "Transfer <-> EP%i, %s, pkgs: %i, bytes: %i",
+  ESP_LOGV(TAG, "Transfer <-> EP%d, %s, pkgs: %d, bytes: %d",
            epnum, ((dir == TUSB_DIR_IN) ? "USB0.HOST (in)" : "HOST->DEV (out)"),
            num_packets, total_bytes);
 
@@ -781,7 +851,7 @@ static void _dcd_int_handler(void* arg)
     // the end of reset.
     USB0.gintsts = USB_ENUMDONE_M;
     enum_done_processing();
-    dcd_event_bus_reset(rhport, TUSB_SPEED_FULL, true);
+    dcd_event_bus_reset(rhport, TUSB_SPEED_HIGH, true); //TODO: FIXME!!!
   }
 
   if(int_status & USB_USBSUSP_M)
@@ -866,13 +936,21 @@ static void _dcd_int_handler(void* arg)
 void dcd_int_enable (uint8_t rhport)
 {
   (void) rhport;
-  esp_intr_alloc(ETS_USB_INTR_SOURCE, ESP_INTR_FLAG_LOWMED, (intr_handler_t) _dcd_int_handler, NULL, &usb_ih);
+#define ETS_USB_INUM 6
+#define ETS_USB_OTG_INTR_SOURCE 69 // For esp32c5
+  /* Connect and enable USB interrupt */
+  ETS_INTR_DISABLE(ETS_USB_INUM);
+  intr_matrix_set(0, ETS_USB_OTG_INTR_SOURCE, ETS_USB_INUM);
+  ETS_ISR_ATTACH(ETS_USB_INUM, _dcd_int_handler, NULL);
+  cpu_hal_set_intr_type(ETS_USB_INUM, INTR_TYPE_LEVEL);
+  cpu_hal_set_intr_level(ETS_USB_INUM, 1);
+  ETS_INTR_ENABLE(ETS_USB_INUM);
 }
 
 void dcd_int_disable (uint8_t rhport)
 {
   (void) rhport;
-  esp_intr_free(usb_ih);
+  //esp_intr_free(usb_ih);
 }
 
-#endif // #if OPT_MCU_ESP32S2 || OPT_MCU_ESP32S3
+#endif // #if OPT_MCU_ESP32S2 || OPT_MCU_ESP32C5 || OPT_MCU_ESP32S3
