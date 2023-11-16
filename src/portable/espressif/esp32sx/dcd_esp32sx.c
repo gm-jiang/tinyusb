@@ -937,7 +937,8 @@ void dcd_int_enable (uint8_t rhport)
 {
   (void) rhport;
 #define ETS_USB_INUM 6
-#define ETS_USB_OTG_INTR_SOURCE 69 // For esp32c5
+//#define ETS_USB_OTG_INTR_SOURCE 69 // For esp32c5
+#define ETS_USB_OTG_INTR_SOURCE 56 // For esp32c6
   /* Connect and enable USB interrupt */
   ETS_INTR_DISABLE(ETS_USB_INUM);
   intr_matrix_set(0, ETS_USB_OTG_INTR_SOURCE, ETS_USB_INUM);
