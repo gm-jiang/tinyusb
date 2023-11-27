@@ -61,7 +61,17 @@
 #define USB_DW_GRSTCTL_AHB_IDLE         BIT(31)
 #define USB_DW_CORE_RST_TIMEOUT_US      (10000)
 
+typedef enum {
+    STAGE_SETUP,
+    STAGE_RX,
+    STAGE_TX,
+    STAGE_STATUS,
+} xfer_stage_t;
+
 typedef struct {
+    usb_dma_quadlet_t *pdma_desc; // dma descriptor pointer
+    uint8_t transfer_type; // control, bulk, isochronous or interrupt
+    uint8_t transfer_stage; // setup stage, data stage, status stage
     uint8_t *buffer;
     // tu_fifo_t * ff; // TODO support dcd_edpt_xfer_fifo API
     uint16_t total_len;
@@ -78,9 +88,41 @@ static uint32_t _setup_packet[2];
 
 #define XFER_CTL_BASE(_ep, _dir) &xfer_status[_ep][_dir]
 static xfer_ctl_t xfer_status[EP_MAX][2];
+static const char *str_stage[] = {"STAGE_SETUP", "STAGE_RX", "STAGE_TX", "STAGE_STATUS"};
 
 // Keep count of how many FIFOs are in use
 static uint8_t _allocated_fifos = 1; //FIFO0 is always in use
+
+/*
+* 2'b00: Host Ready
+* 2'b01: DMA Busy
+* 2'b10: DMA Done
+* 2'b11: Host Busy
+*/
+#define HOST_READY 0
+#define DMA_BUSY   1
+#define DMA_DONE   2
+#define HOST_BUSY  3
+
+static uint8_t get_setup_index(void)
+{
+  return 0;
+}
+
+static void usb_ctrl_desc_init(void)
+{
+  // Prepare desc instance for setup packet
+  usb_dma_quadlet_t *pdesc = (void *)0x40830000;
+  xfer_ctl_t * xfer;
+
+  for (int i = 0; i < EP_MAX; i++) {
+    xfer = XFER_CTL_BASE(i, TUSB_DIR_IN);
+    xfer->pdma_desc = &pdesc[2 * i]; // Hook the desc instance into xfer struct
+
+    xfer = XFER_CTL_BASE(i, TUSB_DIR_OUT);
+    xfer->pdma_desc = &pdesc[2 * i + 1]; // Hook the desc instance into xfer struct
+  }
+}
 
 // Will either return an unused FIFO number, or 0 if all are used.
 static uint8_t get_free_fifo(void)
@@ -100,8 +142,8 @@ static void bus_reset(void)
   USB0.dcfg &= ~USB_DEVADDR_M;
 
   USB0.daintmsk = USB_OUTEPMSK0_M | USB_INEPMSK0_M;
-  USB0.doepmsk  = USB_SETUPMSK_M | USB_XFERCOMPLMSK;
-  USB0.diepmsk  = USB_TIMEOUTMSK_M | USB_DI_XFERCOMPLMSK_M /*| USB_INTKNTXFEMPMSK_M*/;
+  USB0.doepmsk |= USB_STSPHSERCVDMSK | USB_SETUPMSK | USB_XFERCOMPLMSK | USB_BNAOUTINTRMSK;
+  USB0.diepmsk |= USB_TIMEOUTMSK | USB_DI_XFERCOMPLMSK /*| USB_INTKNTXFEMPMSK_M*/;
 
   // "USB Data FIFOs" section in reference manual
   // Peripheral FIFO architecture
@@ -133,7 +175,7 @@ static void bus_reset(void)
   //   Recommended value = 10 + 1 + 2 x (16+2) = 47 --> Let's make it 52
   USB0.grstctl |= 0x10 << USB_TXFNUM_S; // fifo 0x10,
   USB0.grstctl |= USB_TXFFLSH_M;        // Flush fifo
-  USB0.grxfsiz = 512;                   //RX FIFO fifo for High-speed
+  USB0.grxfsiz = 256;                   //RX FIFO fifo for High-speed
 
   // Control IN uses FIFO 0 with 64 bytes ( 16 32-bit word )
   USB0.gnptxfsiz = (16 << USB_NPTXFDEP_S) | (USB0.grxfsiz & 0x0000ffffUL);
@@ -142,6 +184,34 @@ static void bus_reset(void)
   USB0.out_ep_reg[0].doeptsiz |= USB_SUPCNT0_M;
 
   USB0.gintmsk |= USB_IEPINTMSK_M | USB_OEPINTMSK_M;
+}
+
+static void prepare_setup_stage(uint8_t ep_addr, uint8_t index)
+{
+  ESP_EARLY_LOGV(TAG, "Prepare setup_desc[%d] for a new control transfer", index);
+
+  uint8_t const epnum = tu_edpt_number(ep_addr);
+  uint8_t const dir   = tu_edpt_dir(ep_addr);
+
+  xfer_ctl_t * xfer = XFER_CTL_BASE(epnum, dir);
+  xfer->transfer_type = TUSB_XFER_CONTROL;
+  xfer->transfer_stage = STAGE_SETUP;
+
+  xfer->pdma_desc->buffer = (uint8_t *)_setup_packet;
+
+  ESP_EARLY_LOGV(TAG, "%s", str_stage[xfer->transfer_stage]);
+
+  xfer->pdma_desc->st_out.val = 0;                     // Clear all bit field
+  xfer->pdma_desc->st_out.buffer_status = HOST_READY;  // Host ready
+  xfer->pdma_desc->st_out.last = 1;                    // Last descriptor
+  xfer->pdma_desc->st_out.multiple_transfer = 0;       // Multiple Transfer disable
+  xfer->pdma_desc->st_out.int_on_complete = 1;         // Generate interrupt when xfer complete
+  xfer->pdma_desc->st_out.rx_bytes = 64;               // Max Packet Szie of the control endpoint
+
+  // DOEPDMAn register with a memory address to store any SETUP packets received
+  USB0.out_ep_reg[epnum].doepdma = (uint32_t)xfer->pdma_desc;
+  // Enable the DMA for the endpoint 0
+  USB0.out_ep_reg[epnum].doepctl |= USB_EPENA0 | USB_CNAK0;
 }
 
 static void enum_done_processing(void)
@@ -214,6 +284,8 @@ void dcd_init(uint8_t rhport)
 {
   ESP_LOGV(TAG, "DCD init - Start");
 
+  usb_ctrl_desc_init();
+
   // A. Disconnect
   ESP_LOGV(TAG, "DCD init - Soft DISCONNECT and Setting up");
   USB0.dctl |= USB_SFTDISCON_M; // Soft disconnect
@@ -245,7 +317,8 @@ void dcd_init(uint8_t rhport)
     #error "Target dones not support!!!"
 #endif
 
-  USB0.gahbcfg |= USB_NPTXFEMPLVL_M | USB_GLBLLNTRMSK_M; // Global interruptions ON
+  USB0.dcfg |= USB_DESCDMA;  // Enable Scatter/Gather DMA in device mode
+  USB0.gahbcfg |= USB_DMAEN | USB_GLBLLNTRMSK_M; // Global interruptions ON, core operates in DMA mode
   USB0.gotgctl &= ~(USB_BVALIDOVVAL_M | USB_BVALIDOVEN_M | USB_VBVALIDOVVAL_M); //no overrides
 
   // C. Setting SNAKs, then connect
@@ -259,7 +332,6 @@ void dcd_init(uint8_t rhport)
   USB0.gintsts = ~0U; //clear pending ints
   USB0.gintmsk = USB_OTGINTMSK_M   |
                  USB_MODEMISMSK_M  |
-                 USB_RXFLVIMSK_M   |
                  USB_ERLYSUSPMSK_M |
                  USB_USBSUSPMSK_M  |
                  USB_WKUPINTMSK_M  |
@@ -339,6 +411,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc_edpt)
   xfer_ctl_t *xfer = XFER_CTL_BASE(epnum, dir);
   xfer->max_size = tu_edpt_packet_size(desc_edpt);
   xfer->interval = desc_edpt->bInterval;
+  xfer->transfer_type = desc_edpt->bmAttributes.xfer;
 
   if (dir == TUSB_DIR_OUT) {
     out_ep[epnum].doepctl |= USB_USBACTEP1_M |
@@ -384,8 +457,8 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc_edpt)
 
     // Both TXFD and TXSA are in unit of 32-bit words.
     //RX FIFO and IN FIFO 0 was configured during enumeration, hence the "512+ 16".
-    static uint32_t fifo_offset = (512 + 16);
-    uint16_t fifo_size = (xfer->max_size / 4);
+    static uint32_t fifo_offset = (256 + 16);
+    uint16_t fifo_size = (xfer->max_size / 2);
     fifo_offset += fifo_size;
 
     // DIEPTXF starts at FIFO #1.
@@ -434,6 +507,8 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
   xfer->queued_len   = 0;
   xfer->short_packet = false;
 
+  xfer->pdma_desc->buffer = buffer;
+
   uint16_t num_packets = (total_bytes / xfer->max_size);
   uint8_t short_packet_size = total_bytes % xfer->max_size;
 
@@ -446,9 +521,30 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
            epnum, ((dir == TUSB_DIR_IN) ? "USB0.HOST (in)" : "HOST->DEV (out)"),
            num_packets, total_bytes);
 
+
   // IN and OUT endpoint xfers are interrupt-driven, we just schedule them
   // here.
   if (dir == TUSB_DIR_IN) {
+    // | L Bit | SP Bit | Tx bytes         | Functionality                                     |
+    // |-------|--------|------------------|---------------------------------------------------|
+    // |  1    |  1     | Not multiple MPS | Send short packet after sending the normal packet |
+    // |  1    |  0     | Mulitple MPS     | Send normal packet                                |
+    xfer->pdma_desc->st_in.val = 0;
+    xfer->pdma_desc->st_in.tx_bytes = total_bytes;
+    xfer->pdma_desc->st_in.int_on_complete = 1;
+    xfer->pdma_desc->st_in.last = 1;
+    if (short_packet_size) {
+        xfer->pdma_desc->st_in.short_packet = 1;
+    }
+
+    if (epnum == 0) {
+      xfer->transfer_stage = (total_bytes == 0) ? STAGE_STATUS : STAGE_TX;
+      ESP_EARLY_LOGV(TAG, "%s", str_stage[xfer->transfer_stage]);
+    }
+
+    USB0.in_ep_reg[epnum].diepdma = (uint32_t)xfer->pdma_desc;
+    USB0.in_ep_reg[epnum].diepctl |= USB_D_EPENA0 | USB_D_CNAK0;
+#if 0
     // A full IN transfer (multiple packets, possibly) triggers XFRC.
     USB0.in_ep_reg[epnum].dieptsiz = (num_packets << USB_D_PKTCNT0_S) | total_bytes;
     USB0.in_ep_reg[epnum].diepctl |= USB_D_EPENA1_M | USB_D_CNAK1_M; // Enable | CNAK
@@ -464,7 +560,22 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
     if(total_bytes != 0) {
       USB0.dtknqr4_fifoemptymsk |= (1 << epnum);
     }
+#endif
   } else {
+    xfer->pdma_desc->st_out.val = 0;
+    xfer->pdma_desc->st_out.rx_bytes = num_packets * xfer->max_size;
+    xfer->pdma_desc->st_out.int_on_complete = 1;
+    xfer->pdma_desc->st_out.last = 1;
+    xfer->pdma_desc->st_out.multiple_transfer = 0;
+
+    if (epnum == 0) {
+      xfer->transfer_stage = (total_bytes == 0) ? STAGE_STATUS : STAGE_RX;
+      ESP_EARLY_LOGV(TAG, "%s", str_stage[xfer->transfer_stage]);
+    }
+
+    USB0.out_ep_reg[epnum].doepdma = (uint32_t)xfer->pdma_desc;
+    USB0.out_ep_reg[epnum].doepctl |= USB_D_EPENA0 | USB_D_CNAK0;
+#if 0
     // Each complete packet for OUT xfers triggers XFRC.
     USB0.out_ep_reg[epnum].doeptsiz |= USB_PKTCNT0_M | ((xfer->max_size & USB_XFERSIZE0_V) << USB_XFERSIZE0_S);
     USB0.out_ep_reg[epnum].doepctl  |= USB_EPENA0_M | USB_CNAK0_M;
@@ -475,6 +586,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
       uint32_t const odd_frame_now = (USB0.dsts & (1u << USB_SOFFN_S));
       USB0.out_ep_reg[epnum].doepctl |= (odd_frame_now ? USB_DO_SETD0PID1 : USB_DO_SETD1PID1);
     }
+#endif
   }
   return true;
 }
@@ -644,7 +756,7 @@ static void receive_packet(xfer_ctl_t *xfer, /* usb_out_endpoint_t * out_ep, */ 
   xfer->short_packet = (xfer_size < xfer->max_size);
 }
 
-static void transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_t *in_ep, uint8_t fifo_num)
+static void __attribute__((unused)) transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_t *in_ep, uint8_t fifo_num)
 {
   ESP_EARLY_LOGV(TAG, "USB - transmit_packet");
   volatile uint32_t *tx_fifo = USB0.fifo[fifo_num];
@@ -697,7 +809,7 @@ static void transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_t *in_ep,
   }
 }
 
-static void read_rx_fifo(void)
+static void __attribute__((unused)) read_rx_fifo(void)
 {
   // Pop control word off FIFO (completed xfers will have 2 control words,
   // we only pop one ctl word each interrupt).
@@ -755,27 +867,116 @@ static void handle_epout_ints(void)
     xfer_ctl_t *xfer = XFER_CTL_BASE(n, TUSB_DIR_OUT);
 
     if (USB0.daint & (1 << (16 + n))) {
-      // SETUP packet Setup Phase done.
-      if ((USB0.out_ep_reg[n].doepint & USB_SETUP0_M)) {
-        USB0.out_ep_reg[n].doepint = USB_STUPPKTRCVD0_M | USB_SETUP0_M; // clear
-        dcd_event_setup_received(0, (uint8_t *)&_setup_packet[0], true);
-      }
+      ESP_EARLY_LOGV(TAG, "USB - EP%d OUT interrupt status: 0x%x (%s %s %s)", n, USB0.out_ep_reg[n].doepint,
+	              (USB0.out_ep_reg[n].doepint & USB_XFERCOMPL0) ? "XFERCOMPL" : "",
+				  (USB0.out_ep_reg[n].doepint & USB_SETUP0) ? "SETUP" : "",
+				  (USB0.out_ep_reg[n].doepint & USB_STSPHSERCVD0) ? "STSPHSERCVD" : "",
+				  (USB0.out_ep_reg[n].doepint & USB_BNAINTR0) ? "BNA" : "");
 
-      // OUT XFER complete (single packet).q
-      if (USB0.out_ep_reg[n].doepint & USB_XFERCOMPL0_M) {
+/* In DWC_otg_programming page 295.
+ *
+ * | Scenario | STSPHSERCVD BIT(5) | SETUP BIT(3) | XFERCOMPL BIT(0) | value |
+ * | -------- | ------------------ | ------------ | ---------------- | ----- |
+ * | Case A:  | 0                  | 0            | 1                | 1     |
+ * | Case B:  | 0                  | 1            | 0                | 8     |
+ * | Case C:  | 0                  | 1            | 1                | 9     |
+ * | Case D:  | 1                  | 0            | 0                | 32    |
+ * | Case E:  | 1                  | 0            | 1                | 33    |
+ *
+ */
+#define CASE_A 1
+#define CASE_B 8
+#define CASE_C 9
+#define CASE_D 32
+#define CASE_E 33
+      uint32_t ep_int_status = USB0.out_ep_reg[n].doepint & USB0.doepmsk;
+      USB0.out_ep_reg[n].doepint = ep_int_status; // Clear OUT EP interrupts
 
-        ESP_EARLY_LOGV(TAG, "TUSB IRQ - EP OUT - XFER complete (single packet)");
-        USB0.out_ep_reg[n].doepint = USB_XFERCOMPL0_M;
-
-        // Transfer complete if short packet or total len is transferred
-        if (xfer->short_packet || (xfer->queued_len == xfer->total_len)) {
-          xfer->short_packet = false;
-          dcd_event_xfer_complete(0, n, xfer->queued_len, XFER_RESULT_SUCCESS, true);
-        } else {
-          // Schedule another packet to be received.
-          USB0.out_ep_reg[n].doeptsiz |= USB_PKTCNT0_M | ((xfer->max_size & USB_XFERSIZE0_V) << USB_XFERSIZE0_S);
-          USB0.out_ep_reg[n].doepctl |= USB_EPENA0_M | USB_CNAK0_M;
+      switch (ep_int_status) {
+      case CASE_A:
+        //The DWC_otg core has updated the OUT descriptor. Check the SR
+        //(Setup Received) bit in the descriptor to see if the data is for a
+        //Setup or OUT transaction.
+        ESP_EARLY_LOGV(TAG, "Case A");
+        if (xfer->transfer_type == TUSB_XFER_BULK) {
+          dcd_event_xfer_complete(0, n, xfer->total_len - xfer->pdma_desc->st_out.rx_bytes, XFER_RESULT_SUCCESS, true);
+          return;
         }
+        if (xfer->transfer_type == TUSB_XFER_CONTROL) {
+          if (xfer->transfer_stage == STAGE_SETUP) {
+            // Control transfer with SETUP transaction (setup stage)
+            if (xfer->pdma_desc->st_out.setup_received) {
+              dcd_event_setup_received(0, xfer->pdma_desc->buffer, true);
+              return;
+            }
+          }
+          if (xfer->transfer_stage == STAGE_RX) {
+            // Control transfer with OUT transaction (data stage)
+            dcd_event_xfer_complete(0, n, xfer->total_len - xfer->pdma_desc->st_out.rx_bytes, XFER_RESULT_SUCCESS, true);
+            return;
+          }
+          if (xfer->transfer_stage == STAGE_STATUS) {
+            // Control transfer with OUT transaction (status stage), prepare for the next setup packet
+            prepare_setup_stage(tu_edpt_addr(0, TUSB_DIR_OUT), get_setup_index());
+            return;
+          }
+        }
+        break;
+      case CASE_B:
+        //If DOEPINTn.Setup = 1, an interrupt is generated only on the OUT endpoint,
+        //program DIEPCTL.CNAK = 1 to clear the NAK and accept the IN token for the
+        //status stage of this transfer.
+        ESP_EARLY_LOGV(TAG, "Case B");
+        USB0.in_ep_reg[n].diepctl |= USB_CNAK0;
+        if (xfer->transfer_stage == STAGE_RX) {
+          USB0.out_ep_reg[n].doepctl |= USB_CNAK0;
+        }
+        break;
+      case CASE_C:
+        //The DWC_otg core has updated the OUT descriptor for a Setup packet.
+        //In addition, the core is indicating a Setup complete status.
+        ESP_EARLY_LOGV(TAG, "Case C");
+        if (xfer->transfer_stage == STAGE_STATUS) {
+          dcd_event_xfer_complete(0, n, xfer->total_len - xfer->pdma_desc->st_out.rx_bytes, XFER_RESULT_SUCCESS, true);
+          USB0.in_ep_reg[n].diepctl |= USB_CNAK0; //enable reception of ack
+          return;
+        }
+        if (xfer->transfer_stage == STAGE_RX) {
+          // Control transfer with OUT transaction (data stage)
+          dcd_event_xfer_complete(0, n, xfer->total_len - xfer->pdma_desc->st_out.rx_bytes, XFER_RESULT_SUCCESS, true);
+          return;
+        }
+
+        if (xfer->transfer_stage == STAGE_SETUP) {
+          // Control transfer with SETUP transaction (setup stage)
+          if (xfer->pdma_desc->st_out.setup_received) {
+            dcd_event_setup_received(0, xfer->pdma_desc->buffer, true);
+            return;
+          }
+        }
+
+        break;
+      case CASE_D:
+        //If DOEPINTn.StsPhseRcvd interrupt was set during the Data stage
+        //program DIEPCTL.CNAK = 1 to clear the NAK.
+        ESP_EARLY_LOGV(TAG, "Case D");
+        if (xfer->transfer_stage == STAGE_RX) {
+          USB0.in_ep_reg[n].diepctl |= USB_CNAK0;
+        }
+        break;
+      case CASE_E:
+        //The DWC_otg core has updated the OUT descriptor. Check the SR
+        //(Setup Received) bit in the descriptor to see if the data is for a
+        //Setup or OUT transaction. In addition, the host has switched to
+        //control write status phase.
+        ESP_EARLY_LOGV(TAG, "Case E");
+        if (xfer->pdma_desc->st_out.setup_received) {
+          dcd_event_setup_received(0, xfer->pdma_desc->buffer, true);
+          return;
+        }
+
+        dcd_event_xfer_complete(0, n, xfer->total_len, XFER_RESULT_SUCCESS, true);
+        break;
       }
     }
   }
@@ -796,26 +997,10 @@ static void handle_epin_ints(void)
         ESP_EARLY_LOGV(TAG, "TUSB IRQ - IN XFER complete!");
         USB0.in_ep_reg[n].diepint = USB_D_XFERCOMPL0_M;
         dcd_event_xfer_complete(0, n | TUSB_DIR_IN_MASK, xfer->total_len, XFER_RESULT_SUCCESS, true);
-      }
 
-      // XFER FIFO empty
-      if (USB0.in_ep_reg[n].diepint & USB_D_TXFEMP0_M) {
-        ESP_EARLY_LOGV(TAG, "TUSB IRQ - IN XFER FIFO empty!");
-        USB0.in_ep_reg[n].diepint = USB_D_TXFEMP0_M;
-        transmit_packet(xfer, &USB0.in_ep_reg[n], n);
-
-        // Turn off TXFE if all bytes are written.
-        if (xfer->queued_len == xfer->total_len)
-        {
-          USB0.dtknqr4_fifoemptymsk &= ~(1 << n);
+        if (xfer->transfer_stage == STAGE_STATUS) {
+          prepare_setup_stage(tu_edpt_addr(0, TUSB_DIR_OUT), get_setup_index());
         }
-      }
-
-      // XFER Timeout
-      if (USB0.in_ep_reg[n].diepint & USB_D_TIMEOUT0_M) {
-        // Clear interrupt or endpoint will hang.
-        USB0.in_ep_reg[n].diepint = USB_D_TIMEOUT0_M;
-        // Maybe retry?
       }
     }
   }
@@ -852,6 +1037,7 @@ static void _dcd_int_handler(void* arg)
     USB0.gintsts = USB_ENUMDONE_M;
     enum_done_processing();
     dcd_event_bus_reset(rhport, TUSB_SPEED_HIGH, true); //TODO: FIXME!!!
+    prepare_setup_stage(tu_edpt_addr(0, TUSB_DIR_OUT), get_setup_index());
   }
 
   if(int_status & USB_USBSUSP_M)
@@ -888,17 +1074,6 @@ static void _dcd_int_handler(void* arg)
     USB0.gintmsk &= ~USB_SOFMSK_M;
 
     dcd_event_bus_signal(rhport, DCD_EVENT_SOF, true);
-  }
-
-
-  if (int_status & USB_RXFLVI_M) {
-    // RXFLVL bit is read-only
-    ESP_EARLY_LOGV(TAG, "dcd_int_handler - rx!");
-
-    // Mask out RXFLVL while reading data from FIFO
-    USB0.gintmsk &= ~USB_RXFLVIMSK_M;
-    read_rx_fifo();
-    USB0.gintmsk |= USB_RXFLVIMSK_M;
   }
 
   // OUT endpoint interrupt handling.
