@@ -68,6 +68,8 @@ typedef enum {
     STAGE_STATUS,
 } xfer_stage_t;
 
+usb_dma_quadlet_t pdma_desc_bulk[3];
+
 typedef struct {
     usb_dma_quadlet_t *pdma_desc; // dma descriptor pointer
     uint8_t transfer_type; // control, bulk, isochronous or interrupt
@@ -457,7 +459,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc_edpt)
 
     // Both TXFD and TXSA are in unit of 32-bit words.
     //RX FIFO and IN FIFO 0 was configured during enumeration, hence the "512+ 16".
-    static uint32_t fifo_offset = (512 + 16);
+    static uint32_t fifo_offset = (256 + 16);
     uint16_t fifo_size = (xfer->max_size / 2);
     fifo_offset += fifo_size;
 
@@ -529,20 +531,52 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
     // |-------|--------|------------------|---------------------------------------------------|
     // |  1    |  1     | Not multiple MPS | Send short packet after sending the normal packet |
     // |  1    |  0     | Mulitple MPS     | Send normal packet                                |
-    xfer->pdma_desc->st_in.val = 0;
-    xfer->pdma_desc->st_in.tx_bytes = total_bytes;
-    xfer->pdma_desc->st_in.int_on_complete = 1;
-    xfer->pdma_desc->st_in.last = 1;
-    if (short_packet_size) {
-        xfer->pdma_desc->st_in.short_packet = 1;
+    if (xfer->transfer_type == TUSB_XFER_CONTROL) {
+        xfer->pdma_desc->st_in.val = 0;
+        xfer->pdma_desc->st_in.tx_bytes = total_bytes;
+        xfer->pdma_desc->st_in.int_on_complete = 1;
+        xfer->pdma_desc->st_in.last = 1;
+        if (short_packet_size) {
+            xfer->pdma_desc->st_in.short_packet = 1;
+        }
+
+        if (epnum == 0) {
+          xfer->transfer_stage = (total_bytes == 0) ? STAGE_STATUS : STAGE_TX;
+          ESP_EARLY_LOGV(TAG, "%s", str_stage[xfer->transfer_stage]);
+        }
+        USB0.in_ep_reg[epnum].diepdma = (uint32_t)xfer->pdma_desc;
+    }
+    if (xfer->transfer_type == TUSB_XFER_BULK) {
+        pdma_desc_bulk[0].st_in.val = 0;
+        pdma_desc_bulk[0].st_in.tx_bytes = 512;
+        pdma_desc_bulk[0].st_in.int_on_complete = 1;
+        pdma_desc_bulk[0].st_in.last = 0;
+        pdma_desc_bulk[0].st_in.short_packet = 0;
+        pdma_desc_bulk[0].buffer = buffer;
+
+        pdma_desc_bulk[1].st_in.val = 0;
+        pdma_desc_bulk[1].st_in.tx_bytes = 512;
+        pdma_desc_bulk[1].st_in.int_on_complete = 1;
+        pdma_desc_bulk[1].st_in.last = 0;
+        pdma_desc_bulk[1].st_in.short_packet = 0;
+        pdma_desc_bulk[1].buffer = buffer;
+
+        pdma_desc_bulk[2].st_in.val = 0;
+        pdma_desc_bulk[2].st_in.tx_bytes = 512;
+        pdma_desc_bulk[2].st_in.int_on_complete = 1;
+        pdma_desc_bulk[2].st_in.last = 1;
+
+        //send normal packet
+        //pdma_desc_bulk[2].st_in.short_packet = 0;
+
+        //send zero packet afer the last packet
+        pdma_desc_bulk[2].st_in.short_packet = 1;
+
+        pdma_desc_bulk[2].buffer = buffer;
+
+        USB0.in_ep_reg[epnum].diepdma = (uint32_t)&pdma_desc_bulk[0];
     }
 
-    if (epnum == 0) {
-      xfer->transfer_stage = (total_bytes == 0) ? STAGE_STATUS : STAGE_TX;
-      ESP_EARLY_LOGV(TAG, "%s", str_stage[xfer->transfer_stage]);
-    }
-
-    USB0.in_ep_reg[epnum].diepdma = (uint32_t)xfer->pdma_desc;
     USB0.in_ep_reg[epnum].diepctl |= USB_D_EPENA0 | USB_D_CNAK0;
 #if 0
     // A full IN transfer (multiple packets, possibly) triggers XFRC.
