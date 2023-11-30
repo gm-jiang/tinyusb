@@ -548,6 +548,9 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
     }
     if (xfer->transfer_type == TUSB_XFER_BULK) {
         pdma_desc_bulk[0].st_in.val = 0;
+        pdma_desc_bulk[0].st_in.buffer_status = HOST_BUSY;
+        ets_delay_us(1000*5000);
+        pdma_desc_bulk[0].st_in.buffer_status = HOST_READY;
         pdma_desc_bulk[0].st_in.tx_bytes = 512;
         pdma_desc_bulk[0].st_in.int_on_complete = 1;
         pdma_desc_bulk[0].st_in.last = 0;
@@ -555,6 +558,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
         pdma_desc_bulk[0].buffer = buffer;
 
         pdma_desc_bulk[1].st_in.val = 0;
+        //pdma_desc_bulk[1].st_in.buffer_status = HOST_BUSY;
         pdma_desc_bulk[1].st_in.tx_bytes = 512;
         pdma_desc_bulk[1].st_in.int_on_complete = 1;
         pdma_desc_bulk[1].st_in.last = 0;
