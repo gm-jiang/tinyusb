@@ -105,8 +105,11 @@ uint16_t btd_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_
 {
   tusb_desc_endpoint_t const *desc_ep;
   uint16_t drv_len = 0;
+
+#if CFG_TUD_BTH_ISO_ALT_COUNT
   // Size of single alternative of ISO interface
   const uint16_t iso_alt_itf_size = sizeof(tusb_desc_interface_t) + 2 * sizeof(tusb_desc_endpoint_t);
+#endif
   // Size of hci interface
   const uint16_t hci_itf_size = sizeof(tusb_desc_interface_t) + 3 * sizeof(tusb_desc_endpoint_t);
   // Ensure this is BT Primary Controller
@@ -135,6 +138,7 @@ uint16_t btd_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_
 
   drv_len = hci_itf_size;
 
+#if CFG_TUD_BTH_ISO_ALT_COUNT
   // Ensure this is still BT Primary Controller
   TU_ASSERT(TUSB_CLASS_WIRELESS_CONTROLLER == itf_desc->bInterfaceClass &&
             TUD_BT_APP_SUBCLASS == itf_desc->bInterfaceSubClass &&
@@ -187,6 +191,7 @@ uint16_t btd_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_
     _btd_itf.ep_voice_size[dir][itf_desc->bAlternateSetting] = (uint8_t) tu_edpt_packet_size(desc_ep);
     drv_len += iso_alt_itf_size;
   }
+#endif
 
   return drv_len;
 }
